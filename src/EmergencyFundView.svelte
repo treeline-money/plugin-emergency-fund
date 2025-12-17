@@ -857,12 +857,17 @@ ORDER BY month DESC`;
         {#if formLinkedGoalId === null}
           <div class="setup-section">
             <h3>Target Months</h3>
-            <select bind:value={formTargetMonths} class="select-input">
-              <option value={3}>3 months</option>
-              <option value={6}>6 months</option>
-              <option value={9}>9 months</option>
-              <option value={12}>12 months</option>
-            </select>
+            <div class="target-input">
+              <input
+                type="number"
+                min="1"
+                max="24"
+                step="1"
+                bind:value={formTargetMonths}
+                class="number-input"
+              />
+              <span class="input-suffix">months</span>
+            </div>
           </div>
 
           <div class="setup-section">
@@ -1205,12 +1210,17 @@ ORDER BY month DESC`;
             </label>
           {/if}
           {#if !formLinkedGoalId || formTargetMonthsOverride}
-            <select bind:value={formTargetMonths} class="select-input">
-              <option value={3}>3 months</option>
-              <option value={6}>6 months</option>
-              <option value={9}>9 months</option>
-              <option value={12}>12 months</option>
-            </select>
+            <div class="target-input">
+              <input
+                type="number"
+                min="1"
+                max="24"
+                step="1"
+                bind:value={formTargetMonths}
+                class="number-input"
+              />
+              <span class="input-suffix">months</span>
+            </div>
           {/if}
         </div>
 
@@ -1602,6 +1612,34 @@ ORDER BY month DESC`;
     font-size: 13px;
     cursor: pointer;
     margin-bottom: 8px;
+  }
+
+  /* Target months input */
+  .target-input {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .number-input {
+    width: 80px;
+    padding: 8px 12px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 14px;
+    font-family: var(--font-mono);
+  }
+
+  .number-input:focus {
+    outline: none;
+    border-color: var(--accent-primary);
+  }
+
+  .input-suffix {
+    font-size: 13px;
+    color: var(--text-secondary);
   }
 
   .tag-input-row {
