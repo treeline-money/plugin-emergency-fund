@@ -1014,9 +1014,9 @@ ORDER BY month DESC`;
             <span class="status-icon">{statusIcon}</span>
             {runwayData.monthsOfRunway.toFixed(1)} months
           </span>
-          {#if runwayChange !== null}
+          {#if runwayChange !== null && Math.abs(runwayChange) >= 0.05}
             <span class="hero-sub change-indicator" class:positive={runwayChange > 0} class:negative={runwayChange < 0}>
-              {runwayChange > 0 ? '▲' : runwayChange < 0 ? '▼' : '–'}
+              {runwayChange > 0 ? '▲' : '▼'}
               {Math.abs(runwayChange).toFixed(1)} mo from last
             </span>
           {/if}
