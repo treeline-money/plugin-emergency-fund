@@ -414,14 +414,6 @@
         status,
       };
 
-      // Show toast if below 80%
-      if (status !== "on-track") {
-        sdk.toast.warning(
-          "Runway alert",
-          `${monthsOfRunway.toFixed(1)} months is below your ${targetMonths.toFixed(0)}-month target`
-        );
-      }
-
       // Load expense breakdown
       await loadExpenseBreakdown();
     } catch (e) {
