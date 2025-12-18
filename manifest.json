@@ -1,9 +1,10 @@
 {
   "id": "emergency-fund",
   "name": "Emergency Fund",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Track emergency fund runway based on your actual expenses",
   "author": "Treeline",
+  "icon": "shield",
   "main": "index.js",
   "permissions": {
     "tables": {
