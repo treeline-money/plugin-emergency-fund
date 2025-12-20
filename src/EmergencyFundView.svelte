@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
+  import type { PluginSDK } from "@treeline-money/plugin-sdk";
   import type {
-    PluginSDK,
     EmergencyFundConfig,
     EmergencyFundSnapshot,
     Account,

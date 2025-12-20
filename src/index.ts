@@ -1,4 +1,4 @@
-import type { Plugin, PluginContext } from "./types";
+import type { Plugin, PluginContext, PluginSDK } from "@treeline-money/plugin-sdk";
 import EmergencyFundView from "./EmergencyFundView.svelte";
 import { mount, unmount } from "svelte";
 
@@ -25,7 +25,7 @@ export const plugin: Plugin = {
       id: "emergency-fund",
       name: "Emergency Fund",
       icon: "shield",
-      mount: (target: HTMLElement, props: Record<string, any>) => {
+      mount: (target: HTMLElement, props: { sdk: PluginSDK }) => {
         const instance = mount(EmergencyFundView, {
           target,
           props,
