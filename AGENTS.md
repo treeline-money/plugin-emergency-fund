@@ -25,21 +25,31 @@ tl plugin install .  # Install locally for testing
 This plugin uses two tables:
 
 ```sql
--- Configuration (target months, linked accounts)
+-- Configuration (target months, linked accounts, expense settings)
 CREATE TABLE IF NOT EXISTS sys_plugin_emergency_fund_config (
-  id VARCHAR PRIMARY KEY,
-  target_months INTEGER DEFAULT 6,
-  account_ids VARCHAR,         -- comma-separated account IDs
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  id VARCHAR PRIMARY KEY DEFAULT (uuid()),
+  linked_goal_id VARCHAR,                        -- optional link to savings goal
+  target_months DECIMAL(4,1),                    -- target runway in months
+  target_months_override BOOLEAN DEFAULT false,  -- true if manually set
+  fund_allocations JSON DEFAULT '[]',            -- [{account_id, type, value}]
+  expense_account_ids JSON DEFAULT '[]',         -- accounts to analyze for expenses
+  excluded_tags JSON DEFAULT '[]',               -- tags to exclude from expense calc
+  lookback_months INTEGER DEFAULT 6,             -- months of expense history to analyze
+  calculation_method VARCHAR DEFAULT 'mean',     -- mean, median, or trimmed
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 
 -- Historical snapshots for tracking progress
 CREATE TABLE IF NOT EXISTS sys_plugin_emergency_fund_snapshots (
-  id VARCHAR PRIMARY KEY,
-  date DATE NOT NULL,
-  balance DECIMAL NOT NULL,
-  runway_months DECIMAL,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  snapshot_id VARCHAR PRIMARY KEY DEFAULT (uuid()),
+  snapshot_date DATE NOT NULL,
+  fund_balance DECIMAL(15,2) NOT NULL,
+  monthly_expenses DECIMAL(15,2) NOT NULL,
+  months_of_runway DECIMAL(4,1) NOT NULL,
+  notes VARCHAR,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(snapshot_date)
 )
 ```
 

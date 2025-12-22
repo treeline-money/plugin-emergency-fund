@@ -1,6 +1,6 @@
 # Emergency Fund
 
-A [Treeline](https://github.com/zack-schrag/treeline-money) plugin to track your emergency fund runway based on actual spending patterns.
+A [Treeline](https://github.com/treeline-money/treeline) plugin to track your emergency fund runway based on actual spending patterns.
 
 ## Features
 
@@ -20,6 +20,15 @@ A [Treeline](https://github.com/zack-schrag/treeline-money) plugin to track your
 3. **Exclude anomalies**: Filter out tags that aren't representative of normal monthly expenses
 4. **View runway**: See your current runway in months with detailed expense breakdown
 
+## Keyboard Shortcuts
+
+- `s` - Open settings
+- `r` - Refresh data
+- `v` - View underlying SQL query
+- `a` - Add snapshot
+- `j` / `k` - Navigate snapshots
+- `d` - Delete selected snapshot
+
 ## Installation
 
 ### From Community Plugins (Recommended)
@@ -32,15 +41,15 @@ A [Treeline](https://github.com/zack-schrag/treeline-money) plugin to track your
 ### Manual Installation
 
 ```bash
-tl plugin install https://github.com/zack-schrag/treeline-emergency-fund
+tl plugin install https://github.com/treeline-money/plugin-emergency-fund
 # Restart Treeline
 ```
 
 ## Development
 
 ```bash
-git clone https://github.com/zack-schrag/treeline-emergency-fund
-cd treeline-emergency-fund
+git clone https://github.com/treeline-money/plugin-emergency-fund
+cd plugin-emergency-fund
 npm install
 npm run build
 tl plugin install .

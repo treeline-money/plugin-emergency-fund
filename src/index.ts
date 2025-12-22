@@ -11,7 +11,15 @@ export const plugin: Plugin = {
     author: "Treeline",
     permissions: {
       tables: {
-        write: [
+        read: [
+          "transactions",
+          "accounts",
+          "sys_balance_snapshots",
+          "sys_plugin_goals",
+          "sys_plugin_emergency_fund_config",
+          "sys_plugin_emergency_fund_snapshots",
+        ],
+        create: [
           "sys_plugin_emergency_fund_config",
           "sys_plugin_emergency_fund_snapshots",
         ],
