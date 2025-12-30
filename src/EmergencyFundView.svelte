@@ -77,6 +77,9 @@
   // Database setup
   async function ensureTables() {
     try {
+      // Create schema first (required before creating tables in it)
+      await sdk.execute(`CREATE SCHEMA IF NOT EXISTS plugin_emergency_fund`);
+
       await sdk.execute(`
         CREATE TABLE IF NOT EXISTS plugin_emergency_fund.config (
           id VARCHAR PRIMARY KEY DEFAULT (uuid()),
