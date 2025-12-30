@@ -1,13 +1,18 @@
 {
   "id": "emergency-fund",
   "name": "Emergency Fund",
-  "version": "0.3.3",
+  "version": "0.1.4",
   "description": "Track emergency fund runway based on your actual expenses",
   "author": "Treeline",
   "icon": "shield",
   "main": "index.js",
   "permissions": {
-    "read": ["transactions", "accounts", "sys_balance_snapshots", "plugin_goals.goals"],
+    "read": [
+      "transactions",
+      "accounts",
+      "sys_balance_snapshots",
+      "plugin_goals.goals"
+    ],
     "schemaName": "plugin_emergency_fund"
   }
 }
