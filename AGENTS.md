@@ -26,7 +26,7 @@ This plugin uses two tables:
 
 ```sql
 -- Configuration (target months, linked accounts, expense settings)
-CREATE TABLE IF NOT EXISTS sys_plugin_emergency_fund_config (
+CREATE TABLE IF NOT EXISTS plugin_emergency_fund.config (
   id VARCHAR PRIMARY KEY DEFAULT (uuid()),
   linked_goal_id VARCHAR,                        -- optional link to savings goal
   target_months DECIMAL(4,1),                    -- target runway in months
@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS sys_plugin_emergency_fund_config (
 )
 
 -- Historical snapshots for tracking progress
-CREATE TABLE IF NOT EXISTS sys_plugin_emergency_fund_snapshots (
+CREATE TABLE IF NOT EXISTS plugin_emergency_fund.snapshots (
   snapshot_id VARCHAR PRIMARY KEY DEFAULT (uuid()),
   snapshot_date DATE NOT NULL,
   fund_balance DECIMAL(15,2) NOT NULL,

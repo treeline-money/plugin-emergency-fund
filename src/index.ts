@@ -10,20 +10,8 @@ export const plugin: Plugin = {
     description: "Track emergency fund runway based on your actual expenses",
     author: "Treeline",
     permissions: {
-      tables: {
-        read: [
-          "transactions",
-          "accounts",
-          "sys_balance_snapshots",
-          "sys_plugin_goals",
-          "sys_plugin_emergency_fund_config",
-          "sys_plugin_emergency_fund_snapshots",
-        ],
-        create: [
-          "sys_plugin_emergency_fund_config",
-          "sys_plugin_emergency_fund_snapshots",
-        ],
-      },
+      read: ["transactions", "accounts", "sys_balance_snapshots", "plugin_goals.goals"],
+      schemaName: "plugin_emergency_fund",
     },
   },
 

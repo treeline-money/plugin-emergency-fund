@@ -78,7 +78,7 @@
   async function ensureTables() {
     try {
       await sdk.execute(`
-        CREATE TABLE IF NOT EXISTS sys_plugin_emergency_fund_config (
+        CREATE TABLE IF NOT EXISTS plugin_emergency_fund.config (
           id VARCHAR PRIMARY KEY DEFAULT (uuid()),
           linked_goal_id VARCHAR,
           target_months DECIMAL(4,1),
@@ -95,14 +95,14 @@
 
       // Migration: add new columns if they don't exist
       try {
-        await sdk.execute(`ALTER TABLE sys_plugin_emergency_fund_config ADD COLUMN fund_allocations JSON DEFAULT '[]'`);
+        await sdk.execute(`ALTER TABLE plugin_emergency_fund.config ADD COLUMN fund_allocations JSON DEFAULT '[]'`);
       } catch (e) { /* column may already exist */ }
       try {
-        await sdk.execute(`ALTER TABLE sys_plugin_emergency_fund_config ADD COLUMN target_months_override BOOLEAN DEFAULT false`);
+        await sdk.execute(`ALTER TABLE plugin_emergency_fund.config ADD COLUMN target_months_override BOOLEAN DEFAULT false`);
       } catch (e) { /* column may already exist */ }
 
       await sdk.execute(`
-        CREATE TABLE IF NOT EXISTS sys_plugin_emergency_fund_snapshots (
+        CREATE TABLE IF NOT EXISTS plugin_emergency_fund.snapshots (
           snapshot_id VARCHAR PRIMARY KEY DEFAULT (uuid()),
           snapshot_date DATE NOT NULL,
           fund_balance DECIMAL(15,2) NOT NULL,
@@ -158,7 +158,7 @@
     try {
       const rows = await sdk.query<any>(`
         SELECT id, name, target_amount, allocations, icon, active
-        FROM sys_plugin_goals
+        FROM plugin_goals.goals
         WHERE active = true
         ORDER BY name
       `);
@@ -196,7 +196,7 @@
         SELECT id, linked_goal_id, target_months, target_months_override,
                fund_allocations, expense_account_ids, excluded_tags,
                lookback_months, calculation_method, created_at, updated_at
-        FROM sys_plugin_emergency_fund_config
+        FROM plugin_emergency_fund.config
         LIMIT 1
       `);
       if (rows.length > 0) {
@@ -243,7 +243,7 @@
       const rows = await sdk.query<any>(`
         SELECT snapshot_id, snapshot_date, fund_balance, monthly_expenses,
                months_of_runway, notes, created_at
-        FROM sys_plugin_emergency_fund_snapshots
+        FROM plugin_emergency_fund.snapshots
         ORDER BY snapshot_date DESC
         LIMIT 12
       `);
@@ -502,7 +502,7 @@
 
       if (config) {
         await sdk.execute(`
-          UPDATE sys_plugin_emergency_fund_config
+          UPDATE plugin_emergency_fund.config
           SET linked_goal_id = ?,
               target_months = ?,
               target_months_override = ?,
@@ -526,7 +526,7 @@
         ]);
       } else {
         await sdk.execute(`
-          INSERT INTO sys_plugin_emergency_fund_config
+          INSERT INTO plugin_emergency_fund.config
             (linked_goal_id, target_months, target_months_override, fund_allocations,
              expense_account_ids, excluded_tags, lookback_months, calculation_method)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -559,7 +559,7 @@
     try {
       const today = new Date().toISOString().split("T")[0];
       await sdk.execute(`
-        INSERT INTO sys_plugin_emergency_fund_snapshots
+        INSERT INTO plugin_emergency_fund.snapshots
           (snapshot_date, fund_balance, monthly_expenses, months_of_runway)
         VALUES (?, ?, ?, ?)
         ON CONFLICT (snapshot_date) DO UPDATE SET
@@ -577,7 +577,7 @@
   async function deleteSnapshot(snapshotId: string) {
     try {
       await sdk.execute(`
-        DELETE FROM sys_plugin_emergency_fund_snapshots
+        DELETE FROM plugin_emergency_fund.snapshots
         WHERE snapshot_id = ?
       `, [snapshotId]);
       await loadSnapshots();
@@ -608,7 +608,7 @@
 
     try {
       await sdk.execute(`
-        UPDATE sys_plugin_emergency_fund_config
+        UPDATE plugin_emergency_fund.config
         SET excluded_tags = ?,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
