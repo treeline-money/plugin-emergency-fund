@@ -276,6 +276,7 @@
     if (allocations.length === 0) return 0;
 
     const accountIds = allocations.map(a => a.account_id);
+    const placeholders = accountIds.map(() => '?').join(',');
     const balanceRows = await sdk.query<any>(`
       SELECT
         a.account_id,
@@ -290,8 +291,8 @@
           WHERE s2.account_id = s1.account_id
         )
       ) latest ON a.account_id = latest.account_id
-      WHERE a.account_id IN (${accountIds.map(id => `'${id}'`).join(",")})
-    `);
+      WHERE a.account_id IN (${placeholders})
+    `, accountIds);
 
     let fundBalance = 0;
     for (const alloc of allocations) {
@@ -334,15 +335,25 @@
       let monthlyExpenses = 0;
 
       if (config.expense_account_ids.length > 0) {
-        const accountFilter = config.expense_account_ids.map((id) => `'${id}'`).join(",");
+        const params: (string | number)[] = [];
+        const accountPlaceholders = config.expense_account_ids.map(() => '?').join(',');
+        params.push(...config.expense_account_ids);
 
         let tagFilter = "";
         if (config.excluded_tags.length > 0) {
-          const tagConditions = config.excluded_tags
-            .map((tag) => `list_contains(tags, '${tag.replace(/'/g, "''")}')`)
-            .join(" OR ");
+          const tagConditions = config.excluded_tags.map(() => 'list_contains(tags, ?)').join(" OR ");
           tagFilter = `AND NOT (${tagConditions})`;
+          params.push(...config.excluded_tags);
         }
+
+        // Validate lookback_months is a safe integer
+        const lookbackMonths = Math.max(1, Math.min(120, Math.floor(Number(config.lookback_months) || 6)));
+
+        const calcMethod = config.calculation_method === "median"
+          ? "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY total)"
+          : config.calculation_method === "trimmed_mean"
+          ? "AVG(total) FILTER (WHERE total BETWEEN (SELECT PERCENTILE_CONT(0.1) WITHIN GROUP (ORDER BY total) FROM monthly_totals) AND (SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY total) FROM monthly_totals))"
+          : "AVG(total)";
 
         const expenseQuery = `
           WITH monthly_totals AS (
@@ -351,21 +362,16 @@
               SUM(ABS(amount)) AS total
             FROM transactions
             WHERE amount < 0
-              AND account_id IN (${accountFilter})
+              AND account_id IN (${accountPlaceholders})
               ${tagFilter}
-              AND transaction_date >= CURRENT_DATE - INTERVAL '${config.lookback_months}' MONTH
+              AND transaction_date >= CURRENT_DATE - INTERVAL '${lookbackMonths}' MONTH
             GROUP BY month
           )
-          SELECT ${config.calculation_method === "median"
-            ? "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY total)"
-            : config.calculation_method === "trimmed_mean"
-            ? "AVG(total) FILTER (WHERE total BETWEEN (SELECT PERCENTILE_CONT(0.1) WITHIN GROUP (ORDER BY total) FROM monthly_totals) AND (SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY total) FROM monthly_totals))"
-            : "AVG(total)"
-          } AS monthly_avg
+          SELECT ${calcMethod} AS monthly_avg
           FROM monthly_totals
         `;
 
-        const expenseRows = await sdk.query<any>(expenseQuery);
+        const expenseRows = await sdk.query<any>(expenseQuery, params);
         monthlyExpenses = expenseRows[0]?.[0] || 0;
       }
 
@@ -428,15 +434,19 @@
     }
 
     try {
-      const accountFilter = config.expense_account_ids.map((id) => `'${id}'`).join(",");
+      const params: (string | number)[] = [];
+      const accountPlaceholders = config.expense_account_ids.map(() => '?').join(',');
+      params.push(...config.expense_account_ids);
 
       let tagFilter = "";
       if (config.excluded_tags.length > 0) {
-        const tagConditions = config.excluded_tags
-          .map((tag) => `list_contains(tags, '${tag.replace(/'/g, "''")}')`)
-          .join(" OR ");
+        const tagConditions = config.excluded_tags.map(() => 'list_contains(tags, ?)').join(" OR ");
         tagFilter = `AND NOT (${tagConditions})`;
+        params.push(...config.excluded_tags);
       }
+
+      // Validate lookback_months is a safe integer
+      const lookbackMonths = Math.max(1, Math.min(120, Math.floor(Number(config.lookback_months) || 6)));
 
       const rows = await sdk.query<any>(`
         WITH tagged_expenses AS (
@@ -445,21 +455,21 @@
             ABS(amount) AS amount
           FROM transactions
           WHERE amount < 0
-            AND account_id IN (${accountFilter})
+            AND account_id IN (${accountPlaceholders})
             ${tagFilter}
-            AND transaction_date >= CURRENT_DATE - INTERVAL '${config.lookback_months}' MONTH
+            AND transaction_date >= CURRENT_DATE - INTERVAL '${lookbackMonths}' MONTH
         ),
         totals AS (
           SELECT SUM(amount) as grand_total FROM tagged_expenses
         )
         SELECT
           tag,
-          ROUND(SUM(amount) / ${config.lookback_months}, 2) AS monthly_avg,
+          ROUND(SUM(amount) / ${lookbackMonths}, 2) AS monthly_avg,
           ROUND(SUM(amount) / (SELECT grand_total FROM totals) * 100, 1) AS pct
         FROM tagged_expenses
         GROUP BY tag
         ORDER BY monthly_avg DESC
-      `);
+      `, params);
 
       expenseBreakdown = rows.map((r: any) => ({
         tag: r[0],
@@ -474,45 +484,62 @@
   // Save config
   async function saveConfig() {
     try {
-      const escapedTags = JSON.stringify(formExcludedTags);
-      const escapedExpenseAccounts = JSON.stringify(formExpenseAccountIds);
-      const escapedAllocations = JSON.stringify(formFundAllocations);
+      const allocationsJson = JSON.stringify(formFundAllocations);
+      const expenseAccountsJson = JSON.stringify(formExpenseAccountIds);
+      const excludedTagsJson = JSON.stringify(formExcludedTags);
+
+      // Validate calculation_method against whitelist
+      const validMethods = ["mean", "median", "trimmed_mean"];
+      const calcMethod = validMethods.includes(formCalculationMethod) ? formCalculationMethod : "mean";
+
+      // Validate lookback_months is a safe integer
+      const lookbackMonths = Math.max(1, Math.min(120, Math.floor(Number(formLookbackMonths) || 6)));
 
       // When linked to goal, target_months can be null (auto-calc) unless overridden
       const targetMonthsValue = formLinkedGoalId && !formTargetMonthsOverride
-        ? "NULL"
+        ? null
         : formTargetMonths;
 
       if (config) {
         await sdk.execute(`
           UPDATE sys_plugin_emergency_fund_config
-          SET linked_goal_id = ${formLinkedGoalId ? `'${formLinkedGoalId}'` : "NULL"},
-              target_months = ${targetMonthsValue},
-              target_months_override = ${formTargetMonthsOverride},
-              fund_allocations = '${escapedAllocations}',
-              expense_account_ids = '${escapedExpenseAccounts}',
-              excluded_tags = '${escapedTags}',
-              lookback_months = ${formLookbackMonths},
-              calculation_method = '${formCalculationMethod}',
+          SET linked_goal_id = ?,
+              target_months = ?,
+              target_months_override = ?,
+              fund_allocations = ?,
+              expense_account_ids = ?,
+              excluded_tags = ?,
+              lookback_months = ?,
+              calculation_method = ?,
               updated_at = CURRENT_TIMESTAMP
-          WHERE id = '${config.id}'
-        `);
+          WHERE id = ?
+        `, [
+          formLinkedGoalId,
+          targetMonthsValue,
+          formTargetMonthsOverride,
+          allocationsJson,
+          expenseAccountsJson,
+          excludedTagsJson,
+          lookbackMonths,
+          calcMethod,
+          config.id
+        ]);
       } else {
         await sdk.execute(`
           INSERT INTO sys_plugin_emergency_fund_config
             (linked_goal_id, target_months, target_months_override, fund_allocations,
              expense_account_ids, excluded_tags, lookback_months, calculation_method)
-          VALUES (
-            ${formLinkedGoalId ? `'${formLinkedGoalId}'` : "NULL"},
-            ${targetMonthsValue},
-            ${formTargetMonthsOverride},
-            '${escapedAllocations}',
-            '${escapedExpenseAccounts}',
-            '${escapedTags}',
-            ${formLookbackMonths},
-            '${formCalculationMethod}'
-          )
-        `);
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+          formLinkedGoalId,
+          targetMonthsValue,
+          formTargetMonthsOverride,
+          allocationsJson,
+          expenseAccountsJson,
+          excludedTagsJson,
+          lookbackMonths,
+          calcMethod
+        ]);
       }
 
       await loadConfig();
@@ -534,17 +561,12 @@
       await sdk.execute(`
         INSERT INTO sys_plugin_emergency_fund_snapshots
           (snapshot_date, fund_balance, monthly_expenses, months_of_runway)
-        VALUES (
-          '${today}',
-          ${runwayData.fundBalance},
-          ${runwayData.monthlyExpenses},
-          ${runwayData.monthsOfRunway}
-        )
+        VALUES (?, ?, ?, ?)
         ON CONFLICT (snapshot_date) DO UPDATE SET
-          fund_balance = ${runwayData.fundBalance},
-          monthly_expenses = ${runwayData.monthlyExpenses},
-          months_of_runway = ${runwayData.monthsOfRunway}
-      `);
+          fund_balance = EXCLUDED.fund_balance,
+          monthly_expenses = EXCLUDED.monthly_expenses,
+          months_of_runway = EXCLUDED.months_of_runway
+      `, [today, runwayData.fundBalance, runwayData.monthlyExpenses, runwayData.monthsOfRunway]);
       await loadSnapshots();
       sdk.toast.success("Snapshot added");
     } catch (e) {
@@ -556,43 +578,12 @@
     try {
       await sdk.execute(`
         DELETE FROM sys_plugin_emergency_fund_snapshots
-        WHERE snapshot_id = '${snapshotId}'
-      `);
+        WHERE snapshot_id = ?
+      `, [snapshotId]);
       await loadSnapshots();
       sdk.toast.info("Snapshot deleted");
     } catch (e) {
       sdk.toast.error("Failed to delete snapshot", e instanceof Error ? e.message : String(e));
-    }
-  }
-
-  // Dev: Reset plugin data
-  async function resetPluginData() {
-    if (!confirm("This will delete all Emergency Fund config and snapshots. Continue?")) {
-      return;
-    }
-
-    try {
-      await sdk.execute(`DELETE FROM sys_plugin_emergency_fund_config`);
-      await sdk.execute(`DELETE FROM sys_plugin_emergency_fund_snapshots`);
-
-      // Reset state
-      config = null;
-      snapshots = [];
-      runwayData = null;
-      autoTargetMonths = null;
-      formLinkedGoalId = null;
-      formTargetMonths = 6;
-      formTargetMonthsOverride = false;
-      formFundAllocations = [];
-      formExpenseAccountIds = [];
-      formExcludedTags = [];
-      formLookbackMonths = 6;
-      formCalculationMethod = "mean";
-
-      showSetup = true;
-      sdk.toast.success("Plugin data reset");
-    } catch (e) {
-      sdk.toast.error("Failed to reset", e instanceof Error ? e.message : String(e));
     }
   }
 
@@ -613,15 +604,15 @@
     if (!config || tag === 'Untagged') return;
 
     const newExcludedTags = [...config.excluded_tags, tag];
-    const escapedTags = JSON.stringify(newExcludedTags);
+    const excludedTagsJson = JSON.stringify(newExcludedTags);
 
     try {
       await sdk.execute(`
         UPDATE sys_plugin_emergency_fund_config
-        SET excluded_tags = '${escapedTags}',
+        SET excluded_tags = ?,
             updated_at = CURRENT_TIMESTAMP
-        WHERE id = '${config.id}'
-      `);
+        WHERE id = ?
+      `, [excludedTagsJson, config.id]);
 
       await loadConfig();
       await calculateRunway();
@@ -1147,8 +1138,6 @@ ORDER BY month DESC`;
       <span class="hint"><kbd>a</kbd> add snapshot</span>
       <span class="hint"><kbd>j/k</kbd> navigate</span>
       <span class="hint"><kbd>d</kbd> delete</span>
-      <div class="dev-spacer"></div>
-      <button class="btn danger" onclick={resetPluginData}>Reset Plugin Data</button>
     </footer>
   {/if}
 </div>
@@ -2279,7 +2268,4 @@ ORDER BY month DESC`;
     margin-top: 8px;
   }
 
-  .dev-spacer {
-    flex: 1;
-  }
 </style>
