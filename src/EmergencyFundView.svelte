@@ -53,7 +53,7 @@
       loadData();
     });
 
-    await ensureTables();
+    // Tables are created by migrations in index.ts - just load data
     await loadAccounts();
     await loadGoals();
     await loadAvailableTags();
@@ -73,53 +73,6 @@
   onDestroy(() => {
     if (unsubscribe) unsubscribe();
   });
-
-  // Database setup
-  async function ensureTables() {
-    try {
-      // Create schema first (required before creating tables in it)
-      await sdk.execute(`CREATE SCHEMA IF NOT EXISTS plugin_emergency_fund`);
-
-      await sdk.execute(`
-        CREATE TABLE IF NOT EXISTS plugin_emergency_fund.config (
-          id VARCHAR PRIMARY KEY DEFAULT (uuid()),
-          linked_goal_id VARCHAR,
-          target_months DECIMAL(4,1),
-          target_months_override BOOLEAN DEFAULT false,
-          fund_allocations JSON DEFAULT '[]',
-          expense_account_ids JSON DEFAULT '[]',
-          excluded_tags JSON DEFAULT '[]',
-          lookback_months INTEGER DEFAULT 6,
-          calculation_method VARCHAR DEFAULT 'mean',
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-      `);
-
-      // Migration: add new columns if they don't exist
-      try {
-        await sdk.execute(`ALTER TABLE plugin_emergency_fund.config ADD COLUMN fund_allocations JSON DEFAULT '[]'`);
-      } catch (e) { /* column may already exist */ }
-      try {
-        await sdk.execute(`ALTER TABLE plugin_emergency_fund.config ADD COLUMN target_months_override BOOLEAN DEFAULT false`);
-      } catch (e) { /* column may already exist */ }
-
-      await sdk.execute(`
-        CREATE TABLE IF NOT EXISTS plugin_emergency_fund.snapshots (
-          snapshot_id VARCHAR PRIMARY KEY DEFAULT (uuid()),
-          snapshot_date DATE NOT NULL,
-          fund_balance DECIMAL(15,2) NOT NULL,
-          monthly_expenses DECIMAL(15,2) NOT NULL,
-          months_of_runway DECIMAL(4,1) NOT NULL,
-          notes VARCHAR,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          UNIQUE(snapshot_date)
-        )
-      `);
-    } catch (e) {
-      // Tables might already exist
-    }
-  }
 
   // Data loading
   async function loadAccounts() {
