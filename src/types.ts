@@ -12,9 +12,9 @@ export interface FundAllocation {
 
 export interface EmergencyFundConfig {
   id: string;
-  linked_goal_id: string | null;
-  target_months: number | null;  // null = auto-calculate from goal
-  fund_allocations: FundAllocation[];  // for manual mode
+  linked_goal_id: string | null;  // deprecated, kept for backwards compatibility
+  target_months: number | null;
+  fund_allocations: FundAllocation[];
   expense_account_ids: string[];
   excluded_tags: string[];
   lookback_months: number;
@@ -39,15 +39,6 @@ export interface Account {
   account_type: string;
   balance: number;
   institution_name: string;
-}
-
-export interface Goal {
-  id: string;
-  name: string;
-  target_amount: number;
-  allocations: string; // JSON string
-  icon: string;
-  active: boolean;
 }
 
 export interface RunwayData {

@@ -47,11 +47,11 @@ export const plugin: Plugin = {
   manifest: {
     id: "emergency-fund",
     name: "Emergency Fund",
-    version: "0.1.0",
+    version: "0.1.8",
     description: "Track emergency fund runway based on your actual expenses",
     author: "Treeline",
     permissions: {
-      read: ["transactions", "accounts", "sys_balance_snapshots", "plugin_goals.goals"],
+      read: ["transactions", "accounts", "sys_balance_snapshots"],
       schemaName: "plugin_emergency_fund",
     },
   },
