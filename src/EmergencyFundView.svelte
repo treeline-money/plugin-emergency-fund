@@ -22,7 +22,6 @@
   let expenseBreakdown = $state<{ tag: string; amount: number; percent: number }[]>([]);
 
   // UI State
-  let showSettings = $state(false);
   let showSetup = $state(false);
 
   // Settings form state
@@ -211,13 +210,16 @@
       // Get fund balance from allocations
       const fundBalance = await calculateFundBalanceFromAllocations(config.fund_allocations || []);
 
-      // Get monthly expenses
+      // Get monthly expenses (use all accounts if none specified)
       let monthlyExpenses = 0;
+      const expenseAccountIds = config.expense_account_ids.length > 0
+        ? config.expense_account_ids
+        : accounts.map(a => a.account_id);
 
-      if (config.expense_account_ids.length > 0) {
+      if (expenseAccountIds.length > 0) {
         const params: (string | number)[] = [];
-        const accountPlaceholders = config.expense_account_ids.map(() => '?').join(',');
-        params.push(...config.expense_account_ids);
+        const accountPlaceholders = expenseAccountIds.map(() => '?').join(',');
+        params.push(...expenseAccountIds);
 
         let tagFilter = "";
         if (config.excluded_tags.length > 0) {
@@ -230,9 +232,9 @@
         const lookbackMonths = Math.max(1, Math.min(120, Math.floor(Number(config.lookback_months) || 6)));
 
         const calcMethod = config.calculation_method === "median"
-          ? "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY total)"
+          ? "MEDIAN(total)"
           : config.calculation_method === "trimmed_mean"
-          ? "AVG(total) FILTER (WHERE total BETWEEN (SELECT PERCENTILE_CONT(0.1) WITHIN GROUP (ORDER BY total) FROM monthly_totals) AND (SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY total) FROM monthly_totals))"
+          ? "AVG(total) FILTER (WHERE total BETWEEN (SELECT quantile_cont(total, 0.1) FROM monthly_totals) AND (SELECT quantile_cont(total, 0.9) FROM monthly_totals))"
           : "AVG(total)";
 
         const expenseQuery = `
@@ -291,26 +293,30 @@
   }
 
   async function loadExpenseBreakdown() {
-    if (!config || config.expense_account_ids.length === 0) {
+    if (!config) {
+      expenseBreakdown = [];
+      return;
+    }
+
+    // Use all accounts if none specified
+    const expenseAccountIds = config.expense_account_ids.length > 0
+      ? config.expense_account_ids
+      : accounts.map(a => a.account_id);
+
+    if (expenseAccountIds.length === 0) {
       expenseBreakdown = [];
       return;
     }
 
     try {
       const params: (string | number)[] = [];
-      const accountPlaceholders = config.expense_account_ids.map(() => '?').join(',');
-      params.push(...config.expense_account_ids);
-
-      let tagFilter = "";
-      if (config.excluded_tags.length > 0) {
-        const tagConditions = config.excluded_tags.map(() => 'list_contains(tags, ?)').join(" OR ");
-        tagFilter = `AND NOT (${tagConditions})`;
-        params.push(...config.excluded_tags);
-      }
+      const accountPlaceholders = expenseAccountIds.map(() => '?').join(',');
+      params.push(...expenseAccountIds);
 
       // Validate lookback_months is a safe integer
       const lookbackMonths = Math.max(1, Math.min(120, Math.floor(Number(config.lookback_months) || 6)));
 
+      // Show ALL tags in breakdown (don't filter by excluded_tags here - that's only for the calculation)
       const rows = await sdk.query<any>(`
         WITH tagged_expenses AS (
           SELECT
@@ -319,7 +325,6 @@
           FROM transactions
           WHERE amount < 0
             AND account_id IN (${accountPlaceholders})
-            ${tagFilter}
             AND transaction_date >= CURRENT_DATE - INTERVAL '${lookbackMonths}' MONTH
         ),
         totals AS (
@@ -395,9 +400,7 @@
 
       await loadConfig();
       await calculateRunway();
-      showSettings = false;
       showSetup = false;
-      sdk.toast.success("Settings saved");
     } catch (e) {
       sdk.toast.error("Failed to save settings", e instanceof Error ? e.message : String(e));
     }
@@ -539,13 +542,9 @@ ORDER BY month DESC`;
 
   // Keyboard navigation
   function handleKeyDown(e: KeyboardEvent) {
-    if (showSettings || showSetup) return;
+    if (showSetup) return;
 
     switch (e.key) {
-      case "s":
-        e.preventDefault();
-        showSettings = true;
-        break;
       case "r":
         e.preventDefault();
         loadData();
@@ -553,8 +552,6 @@ ORDER BY month DESC`;
       case "v":
         e.preventDefault();
         viewSQL();
-        break;
-      case "Escape":
         break;
     }
   }
@@ -615,7 +612,7 @@ ORDER BY month DESC`;
             <label class="field-label">Emergency Fund Accounts</label>
             <p class="field-hint">Where is your emergency fund held?</p>
             <div class="account-list">
-              {#each accounts.filter(a => ['checking', 'savings', 'money_market'].includes(a.account_type?.toLowerCase() || '')) as account}
+              {#each accounts as account}
                 <label class="account-option">
                   <input
                     type="checkbox"
@@ -626,53 +623,15 @@ ORDER BY month DESC`;
                   <span class="account-balance">{formatCurrency(account.balance)}</span>
                 </label>
               {/each}
-              {#if accounts.filter(a => !['checking', 'savings', 'money_market'].includes(a.account_type?.toLowerCase() || '')).length > 0}
-                <details class="more-accounts">
-                  <summary>Other accounts</summary>
-                  {#each accounts.filter(a => !['checking', 'savings', 'money_market'].includes(a.account_type?.toLowerCase() || '')) as account}
-                    <label class="account-option">
-                      <input
-                        type="checkbox"
-                        checked={formFundAllocations.some(a => a.account_id === account.account_id)}
-                        onchange={() => toggleFundAccount(account.account_id)}
-                      />
-                      <span class="account-name">{account.account_name}</span>
-                      <span class="account-balance">{formatCurrency(account.balance)}</span>
-                    </label>
-                  {/each}
-                </details>
-              {/if}
             </div>
           </div>
 
-          <!-- Step 3: Expense Accounts -->
-          <div class="setup-field">
-            <label class="field-label">Expense Accounts <span class="required-badge">Required</span></label>
-            <p class="field-hint">Which accounts do you spend from?</p>
-            <div class="account-list">
-              {#each accounts as account}
-                <label class="account-option">
-                  <input
-                    type="checkbox"
-                    checked={formExpenseAccountIds.includes(account.account_id)}
-                    onchange={() => toggleExpenseAccount(account.account_id)}
-                  />
-                  <span class="account-name">{account.account_name}</span>
-                  <span class="account-type-badge">{account.account_type}</span>
-                </label>
-              {/each}
-            </div>
-            {#if formExpenseAccountIds.length === 0}
-              <p class="warning-text">Select at least one expense account</p>
-            {/if}
-          </div>
         </div>
 
         <div class="setup-footer">
           <button
             class="btn primary"
             onclick={saveConfig}
-            disabled={formExpenseAccountIds.length === 0}
           >
             Start Tracking
           </button>
@@ -680,253 +639,162 @@ ORDER BY month DESC`;
       </div>
     </div>
   {:else if runwayData}
-    <!-- Main View -->
-    <header class="header">
-      <div class="title-row">
-        <h1 class="title">Emergency Fund</h1>
-        <div class="header-spacer"></div>
-        <button class="icon-btn" onclick={() => showSettings = true} title="Settings (s)">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <circle cx="12" cy="12" r="3"/>
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-          </svg>
-        </button>
-        <button class="icon-btn" onclick={() => loadData()} title="Refresh (r)">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="23 4 23 10 17 10"/>
-            <polyline points="1 20 1 14 7 14"/>
-            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
-          </svg>
-        </button>
-      </div>
+    <!-- Calculator View -->
+    <div class="calculator-view">
+      <!-- Hero -->
+      <div class="calc-hero" style="--status-color: {statusColor}">
+        <span class="status-badge">{statusIcon}</span>
+        <span class="runway-number">{runwayData.monthsOfRunway.toFixed(1)}</span>
+        <span class="runway-label">months of runway</span>
 
-      <!-- Hero Cards - Equal sizing grid -->
-      <div class="hero-cards">
-        <div class="hero-card runway" style="--status-color: {statusColor}">
-          <span class="hero-label">Runway</span>
-          <span class="hero-value">
-            <span class="status-icon">{statusIcon}</span>
-            {runwayData.monthsOfRunway.toFixed(1)}
-          </span>
-          <span class="hero-unit">months</span>
+        <div class="target-row">
+          <span class="target-label">Target:</span>
+          <select
+            class="target-select"
+            value={formTargetMonths}
+            onchange={(e) => {
+              formTargetMonths = Number(e.currentTarget.value);
+              saveConfig();
+            }}
+          >
+            <option value={3}>3 months</option>
+            <option value={6}>6 months</option>
+            <option value={9}>9 months</option>
+            <option value={12}>12 months</option>
+          </select>
+          <div class="target-progress">
+            <div class="progress-bar">
+              <div class="progress-fill" style="width: {Math.min(runwayData.progressPercent, 100)}%"></div>
+            </div>
+            <span class="progress-pct">{runwayData.progressPercent.toFixed(0)}%</span>
+          </div>
         </div>
-        <div class="hero-card">
-          <span class="hero-label">Current Fund</span>
-          <span class="hero-value">{formatCurrency(runwayData.fundBalance)}</span>
-          <span class="hero-unit">saved</span>
-        </div>
-        <div class="hero-card">
-          <span class="hero-label">Monthly Spend</span>
-          <span class="hero-value">{formatCurrency(runwayData.monthlyExpenses)}</span>
-          <span class="hero-unit">{config?.lookback_months}mo avg</span>
-        </div>
-      </div>
 
-      <!-- Progress Bar -->
-      <div class="progress-section">
-        <div class="progress-header">
-          <span class="progress-title">Target: {runwayData.targetMonths} months ({formatCurrency(runwayData.targetAmount)})</span>
-          <span class="progress-pct">{runwayData.progressPercent.toFixed(0)}%</span>
-        </div>
-        <div class="progress-bar">
-          <div
-            class="progress-fill"
-            style="width: {Math.min(runwayData.progressPercent, 100)}%; background: {statusColor}"
-          ></div>
-        </div>
         {#if runwayData.remainingToTarget > 0}
-          <span class="progress-remaining">{formatCurrency(runwayData.remainingToTarget)} to go</span>
+          <span class="target-gap">{formatCurrency(runwayData.remainingToTarget)} to go</span>
         {:else}
-          <span class="progress-remaining success">Target reached!</span>
+          <span class="target-met">Target reached!</span>
         {/if}
       </div>
-    </header>
 
-    <div class="main-content">
-      <!-- Expense Breakdown - Full width -->
-      <section class="section">
-        <div class="section-header">
-          <h2 class="section-title">Expense Breakdown</h2>
-          <button class="sql-link" onclick={viewSQL}>
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-              <polyline points="14 2 14 8 20 8"/>
-            </svg>
-            View SQL
-          </button>
-        </div>
-        <p class="section-hint">
-          Based on {config?.lookback_months}-month {config?.calculation_method === "median" ? "median" : config?.calculation_method === "trimmed_mean" ? "trimmed avg" : "average"}
-          {#if config?.excluded_tags && config.excluded_tags.length > 0}
-            • Excludes: {config.excluded_tags.join(", ")}
-          {/if}
-        </p>
-
-        {#if expenseBreakdown.length > 0}
-          <div class="breakdown-table">
-            <div class="breakdown-header">
-              <span>Category</span>
-              <span>Monthly</span>
-              <span>Share</span>
-              <span>Runway</span>
-            </div>
-            {#each expenseBreakdown as item}
-              <div class="breakdown-row">
-                <span class="breakdown-tag">
-                  {item.tag}
-                  {#if item.tag !== 'Untagged'}
-                    <button
-                      class="exclude-btn"
-                      onclick={() => quickExcludeTag(item.tag)}
-                      title="Exclude from calculation"
-                    >×</button>
-                  {/if}
-                </span>
-                <span class="breakdown-amount">{formatCurrency(item.amount)}</span>
-                <span class="breakdown-percent">{item.percent}%</span>
-                <span class="breakdown-runway">
-                  {(runwayData.fundBalance / item.amount).toFixed(1)} mo
-                </span>
+      <!-- Two Column Calculator -->
+      <div class="calc-panels">
+        <!-- Fund Panel -->
+        <div class="calc-panel">
+          <div class="panel-header">
+            <span class="panel-title">Emergency Fund</span>
+            <span class="panel-total">{formatCurrency(runwayData.fundBalance)}</span>
+          </div>
+          <div class="panel-list">
+            {#each accounts as account}
+              {@const allocation = formFundAllocations.find(a => a.account_id === account.account_id)}
+              {@const isIncluded = !!allocation}
+              <div class="calc-row-wrap" class:included={isIncluded}>
+                <label class="calc-row">
+                  <input
+                    type="checkbox"
+                    checked={isIncluded}
+                    onchange={() => {
+                      toggleFundAccount(account.account_id);
+                      saveConfig();
+                    }}
+                  />
+                  <span class="row-name">{account.account_name}</span>
+                  <span class="row-balance">{formatCurrency(account.balance)}</span>
+                </label>
+                {#if isIncluded}
+                  <div class="allocation-row">
+                    <input
+                      type="number"
+                      class="alloc-input"
+                      min="0"
+                      value={allocation.allocation_value}
+                      onchange={(e) => {
+                        updateAllocation(account.account_id, 'allocation_value', Number(e.currentTarget.value));
+                        saveConfig();
+                      }}
+                    />
+                    <select
+                      class="alloc-type"
+                      value={allocation.allocation_type}
+                      onchange={(e) => {
+                        updateAllocation(account.account_id, 'allocation_type', e.currentTarget.value);
+                        saveConfig();
+                      }}
+                    >
+                      <option value="percentage">%</option>
+                      <option value="fixed">$</option>
+                    </select>
+                  </div>
+                {/if}
               </div>
             {/each}
           </div>
-        {:else}
-          <p class="empty-hint">No expense data available. Make sure you have transactions in your expense accounts.</p>
-        {/if}
-      </section>
+        </div>
 
-    </div>
-
-    <!-- Keyboard Hints -->
-    <footer class="keyboard-hints">
-      <span class="hint"><kbd>s</kbd> settings</span>
-      <span class="hint"><kbd>r</kbd> refresh</span>
-      <span class="hint"><kbd>v</kbd> view SQL</span>
-    </footer>
-  {/if}
-</div>
-
-<!-- Settings Modal -->
-{#if showSettings}
-  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="modal-backdrop" onclick={() => showSettings = false}>
-    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div class="modal" onclick={(e) => e.stopPropagation()}>
-      <div class="modal-header">
-        <h3>Settings</h3>
-        <button class="close-btn" onclick={() => showSettings = false}>×</button>
-      </div>
-
-      <div class="modal-body">
-        <!-- Target Months -->
-        <div class="settings-section">
-          <h4>Target Runway</h4>
-          <div class="target-input">
-            <input
-              type="number"
-              min="1"
-              max="24"
-              step="1"
-              bind:value={formTargetMonths}
-              class="number-input"
-            />
-            <span class="input-suffix">months</span>
+        <!-- Expenses Panel -->
+        <div class="calc-panel">
+          <div class="panel-header">
+            <span class="panel-title">Monthly Expenses</span>
+            <span class="panel-total">{formatCurrency(runwayData.monthlyExpenses)}/mo</span>
           </div>
-        </div>
-
-        <!-- Fund Accounts -->
-        <div class="settings-section">
-          <h4>Emergency Fund Accounts</h4>
-          <p class="setting-hint">Where is your emergency fund held?</p>
-          <div class="account-list compact">
-            {#each accounts as account}
-              <label class="account-option">
-                <input
-                  type="checkbox"
-                  checked={formFundAllocations.some(a => a.account_id === account.account_id)}
-                  onchange={() => toggleFundAccount(account.account_id)}
-                />
-                <span class="account-name">{account.account_name}</span>
-                <span class="account-balance">{formatCurrency(account.balance)}</span>
-              </label>
-            {/each}
-          </div>
-        </div>
-
-        <!-- Expense Accounts -->
-        <div class="settings-section">
-          <h4>Expense Accounts</h4>
-          <p class="setting-hint">Which accounts do you spend from?</p>
-          <div class="account-list compact">
-            {#each accounts as account}
-              <label class="account-option">
-                <input
-                  type="checkbox"
-                  checked={formExpenseAccountIds.includes(account.account_id)}
-                  onchange={() => toggleExpenseAccount(account.account_id)}
-                />
-                <span class="account-name">{account.account_name}</span>
-              </label>
-            {/each}
-          </div>
-        </div>
-
-        <!-- Exclude Tags -->
-        <div class="settings-section">
-          <h4>Exclude Tags</h4>
-          <p class="setting-hint">Exclude certain expense categories from the calculation</p>
-          <select
-            class="select-input"
-            bind:value={newTagInput}
-            onchange={() => { if (newTagInput) addExcludedTag(newTagInput); }}
-          >
-            <option value="">Select a tag to exclude...</option>
-            {#each availableTags.filter(t => !formExcludedTags.includes(t)) as tag}
-              <option value={tag}>{tag}</option>
-            {/each}
-          </select>
-          {#if formExcludedTags.length > 0}
-            <div class="tag-list">
-              {#each formExcludedTags as tag}
-                <span class="tag-chip">
-                  {tag}
-                  <button class="tag-remove" onclick={() => removeExcludedTag(tag)}>×</button>
-                </span>
-              {/each}
-            </div>
-          {/if}
-        </div>
-
-        <!-- Calculation Settings -->
-        <div class="settings-section">
-          <h4>Calculation</h4>
-          <div class="setting-row">
-            <label for="lookback">Lookback:</label>
-            <select id="lookback" bind:value={formLookbackMonths} class="select-input small">
-              <option value={3}>3 months</option>
-              <option value={6}>6 months</option>
-              <option value={12}>12 months</option>
+          <div class="calc-settings-bar">
+            <select
+              class="calc-select"
+              value={formLookbackMonths}
+              onchange={(e) => {
+                formLookbackMonths = Number(e.currentTarget.value);
+                saveConfig();
+              }}
+            >
+              <option value={3}>Last 3 months</option>
+              <option value={6}>Last 6 months</option>
+              <option value={12}>Last 12 months</option>
             </select>
-          </div>
-          <div class="setting-row">
-            <label for="method">Method:</label>
-            <select id="method" bind:value={formCalculationMethod} class="select-input small">
+            <select
+              class="calc-select"
+              value={formCalculationMethod}
+              onchange={(e) => {
+                formCalculationMethod = e.currentTarget.value as "mean" | "median" | "trimmed_mean";
+                saveConfig();
+              }}
+            >
               <option value="mean">Average</option>
               <option value="median">Median</option>
-              <option value="trimmed_mean">Trimmed Average</option>
+              <option value="trimmed_mean">Trimmed Avg</option>
             </select>
           </div>
-          <p class="setting-hint">Trimmed average removes unusually high/low months.</p>
+          <div class="panel-list">
+            {#each expenseBreakdown as item}
+              {@const isExcluded = formExcludedTags.includes(item.tag)}
+              <label class="calc-row" class:excluded={isExcluded} class:included={!isExcluded}>
+                <input
+                  type="checkbox"
+                  checked={!isExcluded}
+                  disabled={item.tag === 'Untagged'}
+                  onchange={() => {
+                    if (isExcluded) {
+                      formExcludedTags = formExcludedTags.filter(t => t !== item.tag);
+                    } else {
+                      formExcludedTags = [...formExcludedTags, item.tag];
+                    }
+                    saveConfig();
+                  }}
+                />
+                <span class="row-name" class:muted={isExcluded}>{item.tag}</span>
+                <span class="row-value" class:muted={isExcluded}>{formatCurrency(item.amount)}</span>
+                <span class="row-pct" class:muted={isExcluded}>{item.percent}%</span>
+              </label>
+            {/each}
+            {#if expenseBreakdown.length === 0}
+              <p class="empty-hint">No expense data found</p>
+            {/if}
+          </div>
         </div>
       </div>
-
-      <div class="modal-footer">
-        <button class="btn secondary" onclick={() => showSettings = false}>Cancel</button>
-        <button class="btn primary" onclick={saveConfig}>Save</button>
-      </div>
     </div>
-  </div>
-{/if}
+  {/if}
+</div>
 
 <style>
   .emergency-fund-view {
@@ -1158,27 +1026,420 @@ ORDER BY month DESC`;
     color: var(--text-muted);
   }
 
-  /* Header */
-  .header {
-    padding: 16px 20px;
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border-primary);
+  /* Calculator View */
+  .calculator-view {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 20px;
+    gap: 20px;
+    overflow-y: auto;
   }
 
-  .title-row {
+  /* Hero */
+  .calc-hero {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    padding: 24px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: 12px;
+  }
+
+  .status-badge {
+    font-size: 20px;
+    line-height: 1;
+    margin-bottom: 4px;
+  }
+
+  .runway-number {
+    font-size: 56px;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    line-height: 1;
+    color: var(--status-color);
+  }
+
+  .runway-label {
+    font-size: 14px;
+    color: var(--text-muted);
+    margin-bottom: 16px;
+  }
+
+  .target-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    max-width: 320px;
+  }
+
+  .target-label {
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+
+  .target-select {
+    padding: 8px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 13px;
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%239ca3af' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    padding-right: 28px;
+    cursor: pointer;
+  }
+
+  .target-select:focus {
+    outline: none;
+    border-color: var(--accent-primary);
+  }
+
+  .target-select option {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    padding: 8px;
+  }
+
+  .target-progress {
+    flex: 1;
     display: flex;
     align-items: center;
     gap: 8px;
   }
 
-  .title {
-    font-size: 16px;
-    font-weight: 600;
-    margin: 0;
+  .target-progress .progress-bar {
+    flex: 1;
+    height: 6px;
+    background: var(--bg-tertiary);
+    border-radius: 3px;
+    overflow: hidden;
   }
 
-  .header-spacer {
+  .target-progress .progress-fill {
+    height: 100%;
+    background: var(--status-color);
+    border-radius: 3px;
+    transition: width 0.2s;
+  }
+
+  .progress-pct {
+    font-size: 12px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    color: var(--text-secondary);
+    min-width: 36px;
+    text-align: right;
+  }
+
+  .target-gap {
+    margin-top: 12px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+
+  .target-met {
+    margin-top: 12px;
+    font-size: 13px;
+    color: var(--accent-success);
+    font-weight: 500;
+  }
+
+  /* Two Column Panels */
+  .calc-panels {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
     flex: 1;
+    min-height: 0;
+  }
+
+  @media (max-width: 700px) {
+    .calc-panels {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  .calc-panel {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border-primary);
+  }
+
+  .panel-title {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    color: var(--text-muted);
+  }
+
+  .panel-total {
+    font-size: 14px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    color: var(--text-primary);
+  }
+
+  .panel-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+  }
+
+  .calc-settings-bar {
+    display: flex;
+    gap: 8px;
+    padding: 10px 14px;
+    background: var(--bg-tertiary);
+    border-bottom: 1px solid var(--border-primary);
+  }
+
+  .calc-select {
+    flex: 1;
+    padding: 8px 12px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 13px;
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%239ca3af' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    padding-right: 28px;
+    cursor: pointer;
+  }
+
+  .calc-select:focus {
+    outline: none;
+    border-color: var(--accent-primary);
+  }
+
+  .calc-select option {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+  }
+
+  /* Expenses panel with sections */
+  .expenses-panel {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .panel-section {
+    border-bottom: 1px solid var(--border-primary);
+  }
+
+  .panel-section:last-of-type {
+    border-bottom: none;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .section-header {
+    padding: 8px 14px;
+    background: var(--bg-tertiary);
+  }
+
+  .section-title {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    color: var(--text-muted);
+  }
+
+  .section-list {
+    padding: 6px 8px;
+    overflow-y: auto;
+  }
+
+  .panel-section:last-of-type .section-list {
+    flex: 1;
+  }
+
+  .calc-row.compact {
+    padding: 4px 6px;
+  }
+
+  .calc-row-wrap {
+    border-radius: 4px;
+    padding: 4px 6px;
+  }
+
+  .calc-row-wrap:hover {
+    background: var(--bg-tertiary);
+  }
+
+  .calc-row-wrap.included {
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    margin-bottom: 4px;
+    padding: 6px;
+  }
+
+  .calc-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+
+  .calc-row.excluded {
+    opacity: 0.5;
+  }
+
+  .allocation-row {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+    padding-left: 26px;
+  }
+
+  .alloc-input {
+    width: 70px;
+    padding: 4px 8px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 12px;
+    font-family: var(--font-mono);
+  }
+
+  .alloc-input:focus {
+    outline: none;
+    border-color: var(--accent-primary);
+  }
+
+  .alloc-type {
+    padding: 4px 8px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 12px;
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%239ca3af' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 4px center;
+    padding-right: 20px;
+    cursor: pointer;
+  }
+
+  .alloc-type:focus {
+    outline: none;
+    border-color: var(--accent-primary);
+  }
+
+  .alloc-type option {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+  }
+
+  .row-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .row-balance {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .row-name.muted {
+    color: var(--text-muted);
+  }
+
+  .row-value {
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+
+  .row-value.muted {
+    color: var(--text-muted);
+  }
+
+  .row-pct {
+    font-size: 11px;
+    color: var(--text-muted);
+    min-width: 32px;
+    text-align: right;
+  }
+
+  .row-pct.muted {
+    color: var(--text-muted);
+  }
+
+  .panel-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 14px;
+    border-top: 1px solid var(--border-primary);
+  }
+
+  .panel-footer.calc-settings {
+    justify-content: flex-start;
+    gap: 8px;
+  }
+
+  .inline-select {
+    padding: 4px 8px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 11px;
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%239ca3af' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 4px center;
+    padding-right: 18px;
+    cursor: pointer;
+  }
+
+  .inline-select:focus {
+    outline: none;
+    border-color: var(--accent-primary);
+  }
+
+  .inline-select option {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+  }
+
+  .footer-hint {
+    font-size: 11px;
+    color: var(--text-muted);
   }
 
   .icon-btn {
@@ -1197,244 +1458,18 @@ ORDER BY month DESC`;
     color: var(--text-primary);
   }
 
-  /* Hero Cards - Grid layout */
-  .hero-cards {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 12px;
-    margin-top: 16px;
-  }
-
-  .hero-card {
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border-primary);
-    border-radius: 8px;
-    padding: 14px 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-
-  .hero-card.runway {
-    border-left: 4px solid var(--status-color);
-  }
-
-  .hero-label {
-    font-size: 11px;
-    font-weight: 500;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
-  }
-
-  .hero-value {
-    font-size: 24px;
-    font-weight: 600;
-    font-family: var(--font-mono);
-    line-height: 1.2;
-  }
-
-  .hero-unit {
-    font-size: 11px;
-    color: var(--text-muted);
-  }
-
-  .status-icon {
-    margin-right: 4px;
-    font-size: 16px;
-  }
-
-  /* Progress */
-  .progress-section {
-    margin-top: 16px;
-  }
-
-  .progress-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 6px;
-  }
-
-  .progress-title {
-    font-size: 12px;
-    color: var(--text-secondary);
-  }
-
-  .progress-pct {
-    font-size: 12px;
-    font-weight: 600;
-    font-family: var(--font-mono);
-  }
-
-  .progress-bar {
-    height: 6px;
-    background: var(--bg-tertiary);
-    border-radius: 3px;
-    overflow: hidden;
-  }
-
-  .progress-fill {
-    height: 100%;
-    border-radius: 3px;
-    transition: width 0.3s ease;
-  }
-
-  .progress-remaining {
-    font-size: 11px;
-    color: var(--text-muted);
-    display: block;
-    margin-top: 4px;
-  }
-
-  .progress-remaining.success {
-    color: var(--accent-success);
-  }
-
-  /* Main Content */
-  .main-content {
-    flex: 1;
-    overflow-y: auto;
-    padding: 16px 20px;
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-  }
-
-  .section {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-primary);
-    border-radius: 8px;
-    padding: 16px;
-  }
-
-  .section-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 8px;
-  }
-
-  .section-title {
-    font-size: 14px;
-    font-weight: 600;
-    margin: 0;
-  }
-
-  .section-hint {
-    font-size: 11px;
-    color: var(--text-muted);
-    margin: 0 0 12px 0;
-  }
-
-  .sql-link {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    padding: 4px 8px;
-    background: transparent;
-    border: 1px solid var(--border-primary);
-    border-radius: 4px;
-    color: var(--text-muted);
-    font-size: 11px;
-    cursor: pointer;
-  }
-
-  .sql-link:hover {
-    background: var(--bg-tertiary);
-    color: var(--accent-primary);
-  }
-
-  /* Breakdown Table */
-  .breakdown-table {
-    display: flex;
-    flex-direction: column;
-    gap: 0;
-  }
-
-  .breakdown-header {
-    display: grid;
-    grid-template-columns: 1fr 90px 60px 70px;
-    gap: 12px;
-    padding: 8px 0;
-    font-size: 10px;
-    font-weight: 600;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    border-bottom: 2px solid var(--border-primary);
-  }
-
-  .breakdown-header span:not(:first-child) {
-    text-align: right;
-  }
-
-  .breakdown-row {
-    display: grid;
-    grid-template-columns: 1fr 90px 60px 70px;
-    gap: 12px;
-    align-items: center;
-    padding: 10px 0;
-    border-bottom: 1px solid var(--border-primary);
-  }
-
-  .breakdown-row:last-child {
-    border-bottom: none;
-  }
-
-  .breakdown-tag {
-    font-size: 13px;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .breakdown-amount {
-    font-family: var(--font-mono);
-    font-size: 13px;
-    text-align: right;
-  }
-
-  .breakdown-percent {
-    font-size: 12px;
-    color: var(--text-muted);
-    text-align: right;
-  }
-
-  .breakdown-runway {
-    font-size: 12px;
-    color: var(--text-muted);
-    text-align: right;
-  }
-
-  .exclude-btn {
-    background: none;
-    border: none;
-    color: var(--text-muted);
-    cursor: pointer;
-    padding: 0 4px;
-    font-size: 14px;
-    opacity: 0;
-    transition: opacity 0.15s;
-    line-height: 1;
-  }
-
-  .breakdown-row:hover .exclude-btn {
-    opacity: 0.5;
-  }
-
-  .exclude-btn:hover {
-    opacity: 1;
-    color: var(--accent-danger);
+  .icon-btn.small {
+    padding: 4px;
   }
 
   .empty-hint {
     font-size: 12px;
     color: var(--text-muted);
     text-align: center;
-    padding: 24px;
+    padding: 16px;
   }
 
-  /* Keyboard Hints */
+  /* Keyboard Hints - removed from calculator view */
   .keyboard-hints {
     display: flex;
     align-items: center;
