@@ -36,6 +36,13 @@
   // Refs
   let containerEl = $state<HTMLDivElement | null>(null);
 
+  // Helper to compute lookback date (avoids ICU extension dependency)
+  function getLookbackDate(months: number): string {
+    const date = new Date();
+    date.setMonth(date.getMonth() - months);
+    return date.toISOString().split('T')[0];
+  }
+
   // Lifecycle
   let unsubscribe: (() => void) | null = null;
 
@@ -237,6 +244,10 @@
           ? "AVG(total) FILTER (WHERE total BETWEEN (SELECT quantile_cont(total, 0.1) FROM monthly_totals) AND (SELECT quantile_cont(total, 0.9) FROM monthly_totals))"
           : "AVG(total)";
 
+        // Compute lookback date in JS to avoid ICU extension dependency
+        const lookbackDate = getLookbackDate(lookbackMonths);
+        params.push(lookbackDate);
+
         const expenseQuery = `
           WITH monthly_totals AS (
             SELECT
@@ -246,7 +257,7 @@
             WHERE amount < 0
               AND account_id IN (${accountPlaceholders})
               ${tagFilter}
-              AND transaction_date >= CURRENT_DATE - INTERVAL '${lookbackMonths}' MONTH
+              AND transaction_date >= ?::DATE
             GROUP BY month
           )
           SELECT ${calcMethod} AS monthly_avg
@@ -316,6 +327,10 @@
       // Validate lookback_months is a safe integer
       const lookbackMonths = Math.max(1, Math.min(120, Math.floor(Number(config.lookback_months) || 6)));
 
+      // Compute lookback date in JS to avoid ICU extension dependency
+      const lookbackDate = getLookbackDate(lookbackMonths);
+      params.push(lookbackDate);
+
       // Show ALL tags in breakdown (don't filter by excluded_tags here - that's only for the calculation)
       const rows = await sdk.query<any>(`
         WITH tagged_expenses AS (
@@ -325,7 +340,7 @@
           FROM transactions
           WHERE amount < 0
             AND account_id IN (${accountPlaceholders})
-            AND transaction_date >= CURRENT_DATE - INTERVAL '${lookbackMonths}' MONTH
+            AND transaction_date >= ?::DATE
         ),
         totals AS (
           SELECT SUM(amount) as grand_total FROM tagged_expenses
@@ -518,6 +533,9 @@
       tagFilter = `AND NOT (${tagConditions})`;
     }
 
+    // Use a literal date instead of CURRENT_DATE to avoid ICU extension dependency
+    const lookbackDate = getLookbackDate(config.lookback_months);
+
     const sql = `-- Emergency Fund Expense Calculation
 WITH monthly_totals AS (
   SELECT
@@ -527,7 +545,7 @@ WITH monthly_totals AS (
   WHERE amount < 0
     AND account_id IN (${accountFilter || "''"})
     ${tagFilter}
-    AND transaction_date >= CURRENT_DATE - INTERVAL '${config.lookback_months}' MONTH
+    AND transaction_date >= '${lookbackDate}'
   GROUP BY month
 )
 SELECT
