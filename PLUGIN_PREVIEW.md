@@ -10,10 +10,10 @@ Instead of guessing whether you have "3-6 months of expenses saved," this plugin
 ## What you'll see
 
 - **Months of runway** - How long your fund would last at your current burn rate
-- **Expense breakdown** - Which categories drive your monthly spending
-- **Progress snapshots** - Track how your runway changes over time
-- **Configurable calculation** - Mean, median, or trimmed mean for expense averaging
+- **Fund allocation** - Select which accounts hold your emergency fund, with percentage or fixed amount allocation
+- **Expense breakdown** - See which tags drive your monthly spending, with the ability to exclude any from the calculation
+- **Configurable calculation** - Mean, median, or trimmed mean for expense averaging over 3, 6, or 12 months
 
 ## Getting started
 
-Link the plugin to your emergency fund (either through a Savings Goal or by selecting accounts directly). Choose which expense accounts to include in the calculation, and optionally exclude tags that shouldn't count (like one-time purchases or transfers). The plugin handles the rest.
+Open the plugin and it works immediately—no setup required. Check the accounts that hold your emergency fund, set your target months, and the calculator updates live. Exclude expense tags that shouldn't count (like one-time purchases or transfers) directly from the breakdown list.
