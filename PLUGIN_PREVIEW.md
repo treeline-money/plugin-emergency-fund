@@ -1,6 +1,6 @@
 See how long your emergency fund would last based on your actual spending patterns.
 
-<!-- TODO: Add screenshot -->
+![Emergency Fund plugin showing months of runway](./screenshots/emergency-fund-light.png)
 
 ## How it works
 
