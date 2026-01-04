@@ -19,10 +19,8 @@
   let accounts = $state<Account[]>([]);
   let availableTags = $state<string[]>([]);
   let runwayData = $state<RunwayData | null>(null);
-  let expenseBreakdown = $state<{ tag: string; amount: number; percent: number }[]>([]);
+  let expenseBreakdown = $state<{ tag: string; amount: number; percent: number; isSystem?: boolean }[]>([]);
 
-  // UI State
-  let showSetup = $state(false);
 
   // Settings form state
   let formTargetMonths = $state<number>(6);
@@ -31,10 +29,12 @@
   let formExcludedTags = $state<string[]>([]);
   let formLookbackMonths = $state(6);
   let formCalculationMethod = $state<"mean" | "median" | "trimmed_mean">("mean");
-  let newTagInput = $state("");
 
   // Refs
   let containerEl = $state<HTMLDivElement | null>(null);
+
+  // Save guard to prevent race conditions
+  let isSaving = $state(false);
 
   // Helper to compute lookback date (avoids ICU extension dependency)
   function getLookbackDate(months: number): string {
@@ -56,12 +56,12 @@
     await loadAvailableTags();
     await loadConfig();
 
+    // Auto-create default config if none exists
     if (!config) {
-      showSetup = true;
-    } else {
-      await calculateRunway();
+      await createDefaultConfig();
     }
 
+    await calculateRunway();
     isLoading = false;
     containerEl?.focus();
   });
@@ -75,7 +75,7 @@
     try {
       // Get accounts with latest balance from snapshots (same pattern as goals plugin)
       const rows = await sdk.query<any>(`
-        SELECT
+        SELECT DISTINCT
           a.account_id,
           COALESCE(a.nickname, a.name) as account_name,
           a.account_type,
@@ -83,13 +83,9 @@
           a.institution_name
         FROM accounts a
         LEFT JOIN (
-          SELECT account_id, balance
-          FROM sys_balance_snapshots s1
-          WHERE snapshot_time = (
-            SELECT MAX(snapshot_time)
-            FROM sys_balance_snapshots s2
-            WHERE s2.account_id = s1.account_id
-          )
+          SELECT DISTINCT ON (account_id) account_id, balance
+          FROM sys_balance_snapshots
+          ORDER BY account_id, snapshot_time DESC
         ) latest ON a.account_id = latest.account_id
         ORDER BY a.name
       `);
@@ -121,6 +117,9 @@
   }
 
   async function loadConfig() {
+    // Skip if a save is in progress to prevent race conditions
+    if (isSaving) return;
+
     try {
       const rows = await sdk.query<any>(`
         SELECT id, linked_goal_id, target_months, target_months_override,
@@ -136,7 +135,14 @@
         let fundAllocations: FundAllocation[] = [];
         if (r[4]) {
           const parsed = typeof r[4] === 'string' ? JSON.parse(r[4]) : r[4];
-          fundAllocations = Array.isArray(parsed) ? parsed : [];
+          const rawAllocations = Array.isArray(parsed) ? parsed : [];
+          // Deduplicate by account_id (keep first occurrence)
+          const seen = new Set<string>();
+          fundAllocations = rawAllocations.filter((a: FundAllocation) => {
+            if (seen.has(a.account_id)) return false;
+            seen.add(a.account_id);
+            return true;
+          });
         }
 
         config = {
@@ -174,6 +180,19 @@
     }
   }
 
+  async function createDefaultConfig() {
+    try {
+      await sdk.execute(`
+        INSERT INTO plugin_emergency_fund.config
+          (target_months, fund_allocations, expense_account_ids, excluded_tags, lookback_months, calculation_method)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `, [6, '[]', '[]', '[]', 6, 'mean']);
+      await loadConfig();
+    } catch (e) {
+      console.error("Failed to create default config:", e);
+    }
+  }
+
   // Helper function to calculate fund balance from allocations
   async function calculateFundBalanceFromAllocations(allocations: FundAllocation[]): Promise<number> {
     if (allocations.length === 0) return 0;
@@ -181,18 +200,14 @@
     const accountIds = allocations.map(a => a.account_id);
     const placeholders = accountIds.map(() => '?').join(',');
     const balanceRows = await sdk.query<any>(`
-      SELECT
+      SELECT DISTINCT
         a.account_id,
         COALESCE(latest.balance, a.balance, 0) as balance
       FROM accounts a
       LEFT JOIN (
-        SELECT account_id, balance
-        FROM sys_balance_snapshots s1
-        WHERE snapshot_time = (
-          SELECT MAX(snapshot_time)
-          FROM sys_balance_snapshots s2
-          WHERE s2.account_id = s1.account_id
-        )
+        SELECT DISTINCT ON (account_id) account_id, balance
+        FROM sys_balance_snapshots
+        ORDER BY account_id, snapshot_time DESC
       ) latest ON a.account_id = latest.account_id
       WHERE a.account_id IN (${placeholders})
     `, accountIds);
@@ -228,11 +243,22 @@
         const accountPlaceholders = expenseAccountIds.map(() => '?').join(',');
         params.push(...expenseAccountIds);
 
+        // Build tag filter - handle both regular tags and system untagged
         let tagFilter = "";
-        if (config.excluded_tags.length > 0) {
-          const tagConditions = config.excluded_tags.map(() => 'list_contains(tags, ?)').join(" OR ");
-          tagFilter = `AND NOT (${tagConditions})`;
-          params.push(...config.excluded_tags);
+        const regularExcludedTags = config.excluded_tags.filter(t => t !== '__system__untagged');
+        const excludeUntagged = config.excluded_tags.includes('__system__untagged');
+
+        const conditions: string[] = [];
+        if (regularExcludedTags.length > 0) {
+          const tagConditions = regularExcludedTags.map(() => 'list_contains(tags, ?)').join(" OR ");
+          conditions.push(`(${tagConditions})`);
+          params.push(...regularExcludedTags);
+        }
+        if (excludeUntagged) {
+          conditions.push('(tags IS NULL OR LEN(tags) = 0)');
+        }
+        if (conditions.length > 0) {
+          tagFilter = `AND NOT (${conditions.join(' OR ')})`;
         }
 
         // Validate lookback_months is a safe integer
@@ -331,16 +357,30 @@
       const lookbackDate = getLookbackDate(lookbackMonths);
       params.push(lookbackDate);
 
-      // Show ALL tags in breakdown (don't filter by excluded_tags here - that's only for the calculation)
+      // Show ALL tags in breakdown including untagged transactions
+      // Use special prefix __system__ to distinguish from user tags
       const rows = await sdk.query<any>(`
-        WITH tagged_expenses AS (
+        WITH base_expenses AS (
           SELECT
-            COALESCE(UNNEST(tags), 'Untagged') AS tag,
-            ABS(amount) AS amount
+            transaction_id,
+            ABS(amount) AS amount,
+            CASE WHEN tags IS NULL OR LEN(tags) = 0 THEN TRUE ELSE FALSE END AS is_untagged,
+            tags
           FROM transactions
           WHERE amount < 0
             AND account_id IN (${accountPlaceholders})
             AND transaction_date >= ?::DATE
+        ),
+        tagged_expenses AS (
+          -- Tagged transactions: one row per tag
+          SELECT UNNEST(tags) AS tag, amount, FALSE AS is_system
+          FROM base_expenses
+          WHERE NOT is_untagged
+          UNION ALL
+          -- Untagged transactions: use special system identifier
+          SELECT '__system__untagged' AS tag, amount, TRUE AS is_system
+          FROM base_expenses
+          WHERE is_untagged
         ),
         totals AS (
           SELECT SUM(amount) as grand_total FROM tagged_expenses
@@ -348,16 +388,18 @@
         SELECT
           tag,
           ROUND(SUM(amount) / ${lookbackMonths}, 2) AS monthly_avg,
-          ROUND(SUM(amount) / (SELECT grand_total FROM totals) * 100, 1) AS pct
+          ROUND(SUM(amount) / NULLIF((SELECT grand_total FROM totals), 0) * 100, 1) AS pct,
+          MAX(CASE WHEN is_system THEN 1 ELSE 0 END) AS is_system
         FROM tagged_expenses
         GROUP BY tag
-        ORDER BY monthly_avg DESC
+        ORDER BY is_system ASC, monthly_avg DESC
       `, params);
 
       expenseBreakdown = rows.map((r: any) => ({
         tag: r[0],
         amount: r[1],
         percent: r[2],
+        isSystem: r[3] === 1,
       }));
     } catch (e) {
       expenseBreakdown = [];
@@ -366,6 +408,10 @@
 
   // Save config
   async function saveConfig() {
+    // Prevent overlapping saves
+    if (isSaving) return;
+    isSaving = true;
+
     try {
       const allocationsJson = JSON.stringify(formFundAllocations);
       const expenseAccountsJson = JSON.stringify(formExpenseAccountIds);
@@ -413,55 +459,13 @@
         ]);
       }
 
+      // Reset save guard before loading so loadConfig isn't blocked
+      isSaving = false;
       await loadConfig();
       await calculateRunway();
-      showSetup = false;
     } catch (e) {
       sdk.toast.error("Failed to save settings", e instanceof Error ? e.message : String(e));
-    }
-  }
-
-  // Tag management
-  function addExcludedTag(tag: string) {
-    if (tag && !formExcludedTags.includes(tag)) {
-      formExcludedTags = [...formExcludedTags, tag];
-    }
-    newTagInput = "";
-  }
-
-  function removeExcludedTag(tag: string) {
-    formExcludedTags = formExcludedTags.filter((t) => t !== tag);
-  }
-
-  // Quick exclude from breakdown table
-  async function quickExcludeTag(tag: string) {
-    if (!config || tag === 'Untagged') return;
-
-    const newExcludedTags = [...config.excluded_tags, tag];
-    const excludedTagsJson = JSON.stringify(newExcludedTags);
-
-    try {
-      await sdk.execute(`
-        UPDATE plugin_emergency_fund.config
-        SET excluded_tags = ?,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `, [excludedTagsJson, config.id]);
-
-      await loadConfig();
-      await calculateRunway();
-      sdk.toast.info(`Excluded "${tag}" from expenses`);
-    } catch (e) {
-      sdk.toast.error("Failed to exclude tag", e instanceof Error ? e.message : String(e));
-    }
-  }
-
-  // Account toggle
-  function toggleExpenseAccount(accountId: string) {
-    if (formExpenseAccountIds.includes(accountId)) {
-      formExpenseAccountIds = formExpenseAccountIds.filter((id) => id !== accountId);
-    } else {
-      formExpenseAccountIds = [...formExpenseAccountIds, accountId];
+      isSaving = false;
     }
   }
 
@@ -585,6 +589,18 @@ ORDER BY month DESC`;
   let statusIcon = $derived(
     runwayData?.status === "on-track" ? "✓" : runwayData?.status === "warning" ? "⚠" : "⚡"
   );
+
+  // Sort accounts with selected ones at top (based on persisted config, not form state)
+  let sortedAccounts = $derived(
+    [...accounts].sort((a, b) => {
+      const savedAllocations = config?.fund_allocations ?? [];
+      const aSelected = savedAllocations.some(f => f.account_id === a.account_id);
+      const bSelected = savedAllocations.some(f => f.account_id === b.account_id);
+      if (aSelected && !bSelected) return -1;
+      if (!aSelected && bSelected) return 1;
+      return a.account_name.localeCompare(b.account_name);
+    })
+  );
 </script>
 
 <div
@@ -599,64 +615,7 @@ ORDER BY month DESC`;
       <div class="spinner"></div>
       <span>Loading emergency fund data...</span>
     </div>
-  {:else if showSetup}
-    <!-- Setup Screen - Modal-like card -->
-    <div class="setup-screen">
-      <div class="setup-card">
-        <div class="setup-header">
-          <h2>Configure Emergency Fund</h2>
-        </div>
-
-        <div class="setup-body">
-          <!-- Step 1: Target -->
-          <div class="setup-field">
-            <label class="field-label">Target Runway</label>
-            <div class="target-input">
-              <input
-                type="number"
-                min="1"
-                max="24"
-                step="1"
-                bind:value={formTargetMonths}
-                class="number-input"
-              />
-              <span class="input-suffix">months of expenses</span>
-            </div>
-            <p class="field-hint">Most experts recommend 3-6 months</p>
-          </div>
-
-          <!-- Step 2: Fund Accounts -->
-          <div class="setup-field">
-            <label class="field-label">Emergency Fund Accounts</label>
-            <p class="field-hint">Where is your emergency fund held?</p>
-            <div class="account-list">
-              {#each accounts as account}
-                <label class="account-option">
-                  <input
-                    type="checkbox"
-                    checked={formFundAllocations.some(a => a.account_id === account.account_id)}
-                    onchange={() => toggleFundAccount(account.account_id)}
-                  />
-                  <span class="account-name">{account.account_name}</span>
-                  <span class="account-balance">{formatCurrency(account.balance)}</span>
-                </label>
-              {/each}
-            </div>
-          </div>
-
-        </div>
-
-        <div class="setup-footer">
-          <button
-            class="btn primary"
-            onclick={saveConfig}
-          >
-            Start Tracking
-          </button>
-        </div>
-      </div>
-    </div>
-  {:else if runwayData}
+  {:else}
     <!-- Calculator View -->
     <div class="calculator-view">
       <!-- Hero -->
@@ -667,19 +626,18 @@ ORDER BY month DESC`;
 
         <div class="target-row">
           <span class="target-label">Target:</span>
-          <select
-            class="target-select"
+          <input
+            type="number"
+            class="target-input"
+            min="1"
+            max="24"
             value={formTargetMonths}
             onchange={(e) => {
-              formTargetMonths = Number(e.currentTarget.value);
+              formTargetMonths = Math.max(1, Math.min(24, Number(e.currentTarget.value) || 6));
               saveConfig();
             }}
-          >
-            <option value={3}>3 months</option>
-            <option value={6}>6 months</option>
-            <option value={9}>9 months</option>
-            <option value={12}>12 months</option>
-          </select>
+          />
+          <span class="target-suffix">months</span>
           <div class="target-progress">
             <div class="progress-bar">
               <div class="progress-fill" style="width: {Math.min(runwayData.progressPercent, 100)}%"></div>
@@ -704,11 +662,11 @@ ORDER BY month DESC`;
             <span class="panel-total">{formatCurrency(runwayData.fundBalance)}</span>
           </div>
           <div class="panel-list">
-            {#each accounts as account}
+            {#each sortedAccounts as account (account.account_id)}
               {@const allocation = formFundAllocations.find(a => a.account_id === account.account_id)}
               {@const isIncluded = !!allocation}
-              <div class="calc-row-wrap" class:included={isIncluded}>
-                <label class="calc-row">
+              <div class="fund-account-row" class:included={isIncluded}>
+                <label class="fund-account-main">
                   <input
                     type="checkbox"
                     checked={isIncluded}
@@ -717,15 +675,19 @@ ORDER BY month DESC`;
                       saveConfig();
                     }}
                   />
-                  <span class="row-name">{account.account_name}</span>
-                  <span class="row-balance">{formatCurrency(account.balance)}</span>
+                  <span class="account-info">
+                    <span class="row-name">{account.account_name}</span>
+                    <span class="row-balance">{formatCurrency(account.balance)}</span>
+                  </span>
                 </label>
                 {#if isIncluded}
-                  <div class="allocation-row">
+                  <div class="allocation-controls">
+                    <span class="alloc-label">Use</span>
                     <input
                       type="number"
                       class="alloc-input"
                       min="0"
+                      max={allocation.allocation_type === 'percentage' ? 100 : undefined}
                       value={allocation.allocation_value}
                       onchange={(e) => {
                         updateAllocation(account.account_id, 'allocation_value', Number(e.currentTarget.value));
@@ -785,24 +747,31 @@ ORDER BY month DESC`;
           <div class="panel-list">
             {#each expenseBreakdown as item}
               {@const isExcluded = formExcludedTags.includes(item.tag)}
-              <label class="calc-row" class:excluded={isExcluded} class:included={!isExcluded}>
-                <input
-                  type="checkbox"
-                  checked={!isExcluded}
-                  disabled={item.tag === 'Untagged'}
-                  onchange={() => {
-                    if (isExcluded) {
-                      formExcludedTags = formExcludedTags.filter(t => t !== item.tag);
-                    } else {
-                      formExcludedTags = [...formExcludedTags, item.tag];
-                    }
-                    saveConfig();
-                  }}
-                />
-                <span class="row-name" class:muted={isExcluded}>{item.tag}</span>
-                <span class="row-value" class:muted={isExcluded}>{formatCurrency(item.amount)}</span>
-                <span class="row-pct" class:muted={isExcluded}>{item.percent}%</span>
-              </label>
+              {@const displayTag = item.isSystem ? 'No tag' : item.tag}
+              <div class="expense-row" class:excluded={isExcluded} class:system-row={item.isSystem}>
+                <label class="expense-row-main">
+                  <input
+                    type="checkbox"
+                    checked={!isExcluded}
+                    onchange={() => {
+                      if (isExcluded) {
+                        formExcludedTags = formExcludedTags.filter(t => t !== item.tag);
+                      } else {
+                        formExcludedTags = [...formExcludedTags, item.tag];
+                      }
+                      saveConfig();
+                    }}
+                  />
+                  <span class="expense-info">
+                    <span class="expense-tag" class:excluded={isExcluded} class:system-tag={item.isSystem}>{displayTag}</span>
+                    {#if isExcluded}
+                      <span class="excluded-badge">excluded</span>
+                    {/if}
+                  </span>
+                  <span class="expense-amount" class:excluded={isExcluded}>{formatCurrency(item.amount)}</span>
+                  <span class="expense-pct" class:excluded={isExcluded}>{item.percent}%</span>
+                </label>
+              </div>
             {/each}
             {#if expenseBreakdown.length === 0}
               <p class="empty-hint">No expense data found</p>
@@ -849,106 +818,19 @@ ORDER BY month DESC`;
     to { transform: rotate(360deg); }
   }
 
-  /* Setup Screen - Modal-like card */
-  .setup-screen {
-    flex: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 24px;
-    background: var(--bg-primary);
-  }
-
-  .setup-card {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-primary);
-    border-radius: 8px;
-    max-width: 480px;
-    width: 100%;
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
-  }
-
-  .setup-header {
-    padding: 20px 24px;
-    border-bottom: 1px solid var(--border-primary);
-  }
-
-  .setup-header h2 {
-    margin: 0;
-    font-size: 18px;
-    font-weight: 600;
-  }
-
-  .setup-body {
-    padding: 24px;
-    display: flex;
-    flex-direction: column;
-    gap: 24px;
-    max-height: 60vh;
-    overflow-y: auto;
-  }
-
-  .setup-field {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-
-  .field-label {
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--text-primary);
-  }
-
-  .field-hint {
-    font-size: 12px;
-    color: var(--text-muted);
-    margin: 0;
-  }
-
-  .setup-footer {
-    padding: 16px 24px;
-    border-top: 1px solid var(--border-primary);
-    display: flex;
-    justify-content: flex-end;
-  }
-
-  .more-accounts {
-    margin-top: 8px;
-    font-size: 12px;
-  }
-
-  .more-accounts summary {
-    cursor: pointer;
-    color: var(--text-muted);
-    padding: 4px 0;
-  }
-
-  .more-accounts summary:hover {
-    color: var(--accent-primary);
-  }
-
-  .account-type-badge {
-    font-size: 10px;
-    padding: 2px 6px;
-    background: var(--bg-tertiary);
-    border-radius: 3px;
-    color: var(--text-muted);
-    text-transform: uppercase;
-  }
-
   /* Custom Checkbox */
   input[type="checkbox"] {
     appearance: none;
     -webkit-appearance: none;
-    width: 16px;
-    height: 16px;
-    border: 2px solid var(--border-primary);
-    border-radius: 3px;
+    width: 18px;
+    height: 18px;
+    border: 1.5px solid var(--border-primary);
+    border-radius: 4px;
     background: var(--bg-primary);
     cursor: pointer;
     position: relative;
     flex-shrink: 0;
+    transition: all 0.15s ease;
   }
 
   input[type="checkbox"]:checked {
@@ -959,10 +841,10 @@ ORDER BY month DESC`;
   input[type="checkbox"]:checked::after {
     content: '';
     position: absolute;
-    left: 4px;
-    top: 1px;
-    width: 4px;
-    height: 8px;
+    left: 5px;
+    top: 2px;
+    width: 5px;
+    height: 9px;
     border: solid white;
     border-width: 0 2px 2px 0;
     transform: rotate(45deg);
@@ -971,77 +853,17 @@ ORDER BY month DESC`;
   input[type="checkbox"]:focus {
     outline: none;
     border-color: var(--accent-primary);
-    box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.2);
+    box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.25);
   }
 
-  input[type="checkbox"]:hover:not(:checked) {
-    border-color: var(--text-muted);
-  }
-
-  /* Account List */
-  .account-list {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    max-height: 180px;
-    overflow-y: auto;
-  }
-
-  .account-list.compact {
-    max-height: 140px;
-  }
-
-  .account-option {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 8px 10px;
-    background: var(--bg-primary);
-    border-radius: 4px;
-    cursor: pointer;
-    font-size: 13px;
-  }
-
-  .account-option:hover {
+  input[type="checkbox"]:hover:not(:checked):not(:disabled) {
+    border-color: var(--accent-primary);
     background: var(--bg-tertiary);
   }
 
-  .account-name {
-    flex: 1;
-  }
-
-  .account-balance {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--text-muted);
-  }
-
-  /* Target Input */
-  .target-input {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .number-input {
-    width: 80px;
-    padding: 8px 12px;
-    background: var(--bg-primary);
-    border: 1px solid var(--border-primary);
-    border-radius: 4px;
-    color: var(--text-primary);
-    font-size: 14px;
-    font-family: var(--font-mono);
-  }
-
-  .number-input:focus {
-    outline: none;
-    border-color: var(--accent-primary);
-  }
-
-  .input-suffix {
-    font-size: 13px;
-    color: var(--text-muted);
+  input[type="checkbox"]:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
   }
 
   /* Calculator View */
@@ -1099,31 +921,33 @@ ORDER BY month DESC`;
     color: var(--text-muted);
   }
 
-  .target-select {
+  .target-input {
+    width: 50px;
     padding: 8px;
     background: var(--bg-primary);
     border: 1px solid var(--border-primary);
     border-radius: 4px;
     color: var(--text-primary);
-    font-size: 13px;
-    appearance: none;
-    -webkit-appearance: none;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%239ca3af' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 8px center;
-    padding-right: 28px;
-    cursor: pointer;
+    font-size: 14px;
+    font-family: var(--font-mono);
+    text-align: center;
+    -moz-appearance: textfield;
   }
 
-  .target-select:focus {
+  .target-input::-webkit-outer-spin-button,
+  .target-input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+
+  .target-input:focus {
     outline: none;
     border-color: var(--accent-primary);
   }
 
-  .target-select option {
-    background: var(--bg-secondary);
-    color: var(--text-primary);
-    padding: 8px;
+  .target-suffix {
+    font-size: 13px;
+    color: var(--text-muted);
   }
 
   .target-progress {
@@ -1258,67 +1082,24 @@ ORDER BY month DESC`;
     color: var(--text-primary);
   }
 
-  /* Expenses panel with sections */
-  .expenses-panel {
-    display: flex;
-    flex-direction: column;
+  /* Fund Account Row */
+  .fund-account-row {
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-bottom: 4px;
+    transition: background 0.15s ease;
   }
 
-  .panel-section {
-    border-bottom: 1px solid var(--border-primary);
-  }
-
-  .panel-section:last-of-type {
-    border-bottom: none;
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
-  }
-
-  .section-header {
-    padding: 8px 14px;
+  .fund-account-row:hover {
     background: var(--bg-tertiary);
   }
 
-  .section-title {
-    font-size: 10px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
-    color: var(--text-muted);
-  }
-
-  .section-list {
-    padding: 6px 8px;
-    overflow-y: auto;
-  }
-
-  .panel-section:last-of-type .section-list {
-    flex: 1;
-  }
-
-  .calc-row.compact {
-    padding: 4px 6px;
-  }
-
-  .calc-row-wrap {
-    border-radius: 4px;
-    padding: 4px 6px;
-  }
-
-  .calc-row-wrap:hover {
-    background: var(--bg-tertiary);
-  }
-
-  .calc-row-wrap.included {
+  .fund-account-row.included {
     background: var(--bg-primary);
     border: 1px solid var(--border-primary);
-    margin-bottom: 4px;
-    padding: 6px;
   }
 
-  .calc-row {
+  .fund-account-main {
     display: flex;
     align-items: center;
     gap: 10px;
@@ -1326,26 +1107,46 @@ ORDER BY month DESC`;
     font-size: 13px;
   }
 
-  .calc-row.excluded {
-    opacity: 0.5;
+  .account-info {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-width: 0;
   }
 
-  .allocation-row {
+  .allocation-controls {
     display: flex;
+    align-items: center;
     gap: 6px;
-    margin-top: 6px;
-    padding-left: 26px;
+    margin-top: 8px;
+    padding-left: 28px;
+  }
+
+  .alloc-label {
+    font-size: 12px;
+    color: var(--text-muted);
   }
 
   .alloc-input {
-    width: 70px;
-    padding: 4px 8px;
+    width: 60px;
+    padding: 5px 8px;
     background: var(--bg-secondary);
     border: 1px solid var(--border-primary);
     border-radius: 4px;
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: 13px;
     font-family: var(--font-mono);
+    text-align: right;
+    /* Hide native number spinners */
+    -moz-appearance: textfield;
+  }
+
+  .alloc-input::-webkit-outer-spin-button,
+  .alloc-input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
   }
 
   .alloc-input:focus {
@@ -1354,18 +1155,18 @@ ORDER BY month DESC`;
   }
 
   .alloc-type {
-    padding: 4px 8px;
+    padding: 5px 24px 5px 8px;
     background: var(--bg-secondary);
     border: 1px solid var(--border-primary);
     border-radius: 4px;
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: 13px;
+    font-weight: 500;
     appearance: none;
     -webkit-appearance: none;
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%239ca3af' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
     background-repeat: no-repeat;
-    background-position: right 4px center;
-    padding-right: 20px;
+    background-position: right 6px center;
     cursor: pointer;
   }
 
@@ -1377,6 +1178,93 @@ ORDER BY month DESC`;
   .alloc-type option {
     background: var(--bg-secondary);
     color: var(--text-primary);
+  }
+
+  /* Expense Row */
+  .expense-row {
+    border-radius: 6px;
+    padding: 6px 8px;
+    margin-bottom: 2px;
+    transition: all 0.15s ease;
+  }
+
+  .expense-row:hover {
+    background: var(--bg-tertiary);
+  }
+
+  .expense-row.excluded {
+    opacity: 0.6;
+  }
+
+  .expense-row-main {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+
+  .expense-info {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .expense-tag {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .expense-tag.excluded {
+    text-decoration: line-through;
+    color: var(--text-muted);
+  }
+
+  .expense-tag.system-tag {
+    font-style: italic;
+    color: var(--text-muted);
+  }
+
+  .system-row {
+    border-top: 1px solid var(--border-primary);
+    margin-top: 4px;
+    padding-top: 8px;
+  }
+
+  .excluded-badge {
+    font-size: 10px;
+    padding: 2px 6px;
+    background: var(--bg-tertiary);
+    border-radius: 3px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    flex-shrink: 0;
+  }
+
+  .expense-amount {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    text-align: right;
+    min-width: 70px;
+  }
+
+  .expense-amount.excluded {
+    color: var(--text-muted);
+  }
+
+  .expense-pct {
+    font-size: 11px;
+    color: var(--text-muted);
+    min-width: 36px;
+    text-align: right;
+  }
+
+  .expense-pct.excluded {
+    color: var(--text-muted);
   }
 
   .row-name {
@@ -1392,282 +1280,11 @@ ORDER BY month DESC`;
     color: var(--text-muted);
   }
 
-  .row-name.muted {
-    color: var(--text-muted);
-  }
-
-  .row-value {
-    font-family: var(--font-mono);
-    font-size: 12px;
-  }
-
-  .row-value.muted {
-    color: var(--text-muted);
-  }
-
-  .row-pct {
-    font-size: 11px;
-    color: var(--text-muted);
-    min-width: 32px;
-    text-align: right;
-  }
-
-  .row-pct.muted {
-    color: var(--text-muted);
-  }
-
-  .panel-footer {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 8px 14px;
-    border-top: 1px solid var(--border-primary);
-  }
-
-  .panel-footer.calc-settings {
-    justify-content: flex-start;
-    gap: 8px;
-  }
-
-  .inline-select {
-    padding: 4px 8px;
-    background: var(--bg-primary);
-    border: 1px solid var(--border-primary);
-    border-radius: 4px;
-    color: var(--text-primary);
-    font-size: 11px;
-    appearance: none;
-    -webkit-appearance: none;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%239ca3af' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 4px center;
-    padding-right: 18px;
-    cursor: pointer;
-  }
-
-  .inline-select:focus {
-    outline: none;
-    border-color: var(--accent-primary);
-  }
-
-  .inline-select option {
-    background: var(--bg-secondary);
-    color: var(--text-primary);
-  }
-
-  .footer-hint {
-    font-size: 11px;
-    color: var(--text-muted);
-  }
-
-  .icon-btn {
-    background: none;
-    border: 1px solid var(--border-primary);
-    border-radius: 4px;
-    padding: 6px;
-    cursor: pointer;
-    color: var(--text-muted);
-    display: flex;
-    align-items: center;
-  }
-
-  .icon-btn:hover {
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-  }
-
-  .icon-btn.small {
-    padding: 4px;
-  }
-
   .empty-hint {
     font-size: 12px;
     color: var(--text-muted);
     text-align: center;
     padding: 16px;
-  }
-
-  /* Keyboard Hints - removed from calculator view */
-  .keyboard-hints {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    padding: 8px 20px;
-    background: var(--bg-secondary);
-    border-top: 1px solid var(--border-primary);
-    font-size: 11px;
-    color: var(--text-muted);
-  }
-
-  .hint {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-  }
-
-  .hint kbd {
-    display: inline-block;
-    padding: 2px 5px;
-    background: var(--bg-primary);
-    border: 1px solid var(--border-primary);
-    border-radius: 3px;
-    font-family: var(--font-mono);
-    font-size: 10px;
-  }
-
-  /* Tag chips */
-  .tag-list {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    margin-top: 8px;
-  }
-
-  .tag-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 4px 8px;
-    background: var(--accent-primary);
-    color: white;
-    border-radius: 4px;
-    font-size: 11px;
-  }
-
-  .tag-remove {
-    background: none;
-    border: none;
-    color: white;
-    cursor: pointer;
-    padding: 0 2px;
-    font-size: 14px;
-    opacity: 0.8;
-  }
-
-  .tag-remove:hover {
-    opacity: 1;
-  }
-
-  .select-input {
-    width: 100%;
-    padding: 8px 12px;
-    background: var(--bg-primary);
-    border: 1px solid var(--border-primary);
-    border-radius: 4px;
-    color: var(--text-primary);
-    font-size: 13px;
-    appearance: none;
-    -webkit-appearance: none;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%239ca3af' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 8px center;
-    padding-right: 28px;
-    cursor: pointer;
-  }
-
-  .select-input:focus {
-    outline: none;
-    border-color: var(--accent-primary);
-  }
-
-  .select-input option {
-    background: var(--bg-secondary);
-    color: var(--text-primary);
-    padding: 8px;
-  }
-
-  .select-input.small {
-    width: auto;
-  }
-
-  /* Modal */
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
-  }
-
-  .modal {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-primary);
-    border-radius: 8px;
-    width: 500px;
-    max-width: 95vw;
-    max-height: 85vh;
-    display: flex;
-    flex-direction: column;
-  }
-
-  .modal-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 16px;
-    border-bottom: 1px solid var(--border-primary);
-  }
-
-  .modal-header h3 {
-    margin: 0;
-    font-size: 16px;
-  }
-
-  .close-btn {
-    background: none;
-    border: none;
-    color: var(--text-muted);
-    font-size: 20px;
-    cursor: pointer;
-    padding: 4px 8px;
-  }
-
-  .close-btn:hover {
-    color: var(--text-primary);
-  }
-
-  .modal-body {
-    flex: 1;
-    overflow-y: auto;
-    padding: 16px;
-  }
-
-  .modal-footer {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-    padding: 16px;
-    border-top: 1px solid var(--border-primary);
-  }
-
-  .settings-section {
-    margin-bottom: 20px;
-  }
-
-  .settings-section h4 {
-    font-size: 13px;
-    font-weight: 600;
-    margin: 0 0 8px 0;
-  }
-
-  .setting-hint {
-    font-size: 11px;
-    color: var(--text-muted);
-    margin-top: 8px;
-  }
-
-  .setting-row {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    margin-bottom: 8px;
-  }
-
-  .setting-row label {
-    font-size: 13px;
-    min-width: 80px;
   }
 
   /* Buttons */
@@ -1690,44 +1307,9 @@ ORDER BY month DESC`;
     opacity: 0.9;
   }
 
-  .btn.secondary {
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border-primary);
-    color: var(--text-primary);
-  }
-
-  .btn.secondary:hover {
-    background: var(--bg-primary);
-  }
-
-  .btn.danger {
-    background: var(--accent-danger, #dc2626);
-    color: white;
-    font-size: 11px;
-    padding: 4px 8px;
-  }
-
-  .btn.danger:hover {
-    opacity: 0.9;
-  }
-
   .btn:disabled {
     opacity: 0.5;
     cursor: not-allowed;
-  }
-
-  /* Required field styles */
-  .required-badge {
-    font-size: 10px;
-    font-weight: 500;
-    color: var(--accent-danger, #dc2626);
-    margin-left: 4px;
-  }
-
-  .warning-text {
-    font-size: 12px;
-    color: var(--accent-danger, #dc2626);
-    margin-top: 8px;
   }
 
 </style>
