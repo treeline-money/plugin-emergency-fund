@@ -564,8 +564,6 @@ ORDER BY month DESC`;
 
   // Keyboard navigation
   function handleKeyDown(e: KeyboardEvent) {
-    if (showSetup) return;
-
     switch (e.key) {
       case "r":
         e.preventDefault();
