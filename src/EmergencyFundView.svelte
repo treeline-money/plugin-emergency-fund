@@ -508,12 +508,7 @@
 
   // Formatting
   function formatCurrency(amount: number): string {
-    return new Intl.NumberFormat("en-US", {
-      style: "currency",
-      currency: "USD",
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 0,
-    }).format(amount);
+    return sdk.currency.format(amount);
   }
 
   function formatDate(dateStr: string): string {
